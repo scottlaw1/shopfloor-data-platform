@@ -18,6 +18,9 @@ The output is deterministic for a given `--seed`. The window ends on a fixed dat
 | `customers.csv` | booking-app signup export |
 | `appointments.csv` | booking-system export (statuses: completed, no_show, cancelled, rescheduled, booked) |
 | `billing_events.jsonl` | payment-processor webhook log (subscriptions, charges, failures, refunds) |
+| `crm_contacts.csv` | marketing CRM export (its own contact IDs; emails/phones don't line up with booking) |
+
+`data/answer_key/crm_customer_matches.csv` holds the true `crm_contact_id → customer_id` mapping, with a `match_type` that names the mismatches applied to each pair. Use it to score customer-matching logic, and never read it from models.
 
 ### Known messes (the cleanup checklist)
 
@@ -57,3 +60,26 @@ The generator plants these on purpose and prints a count for each one when it ru
 - `billing_events.currency` is mostly `usd` and sometimes `USD`.
 - `shops.zipcode` is sometimes ZIP+4, and some ZIPs have leading zeros, so read it as a string.
 - Phone numbers use whatever formats Faker produced (extensions, `001-` prefixes, dots, and so on).
+
+#### CRM vs booking (entity resolution)
+
+- `crm_contacts.booking_customer_id` is filled on only about half of linked contacts, and about 3% of those point at the wrong customer. You have to match on attributes.
+- About 10% of booking customers never made it into the CRM. About 15% extra CRM contacts are leads who never booked. Some leads share a surname and shop with a real customer.
+- A booking customer's two near-duplicate accounts map to **one** CRM contact. About 2% of CRM contacts are internal duplicates (`lead_source=import`).
+- The CRM stores emails lowercase and trimmed. About 40% still differ from booking:
+  - a different address (work email or new provider)
+  - a domain typo (`gmial.com`, `hotmail.con`)
+  - a Gmail alias (dots removed, `+tag` added or stripped)
+  - a different local part (`jsmith42@`)
+  - null
+- The CRM stores phones as E.164 (`+17125551234`) with no extensions. About 35% still differ from booking:
+  - a different number
+  - a one-digit typo or two transposed digits
+  - 10 or 11 digits with no `+`
+  - null
+- Names: nicknames (William ↔ Bill), swapped first and last names, an UPPERCASE last name, trailing spaces.
+- `email_opt_out` has the opposite meaning of booking's `marketing_opt_in`, and about 10% of contacts genuinely disagree.
+- `preferred_location` is free text (shop name or city), not a `shop_id`.
+- Timestamps: `created_at` is naive **America/New_York** time (the CRM portal's timezone). `last_activity_at` is epoch milliseconds.
+
+With seed 42, a naive email join finds about 57% of the true pairs and a phone-digits join finds about 68%. Using both finds about 86%, plus 16 false positives.

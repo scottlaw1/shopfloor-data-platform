@@ -7,11 +7,15 @@ Fakes five raw sources for a barbershop SaaS and lands them in data/raw/:
     customers.csv         booking-app signup export
     appointments.csv      booking-system export (no-shows, reschedules, tips)
     billing_events.jsonl  payment-processor webhook log (subscriptions, refunds, failed charges)
+    crm_contacts.csv      marketing CRM export whose emails/phones don't line up with booking
 
 Clean records are generated first, then explicit mess_* / inject_* functions
 corrupt them on purpose (duplicates, nulls, timezone mismatches, format noise)
 so downstream dbt models have real cleanup work to do. See README.md for the
 full list of injected defects.
+
+The true CRM-contact -> booking-customer mapping goes to
+data/answer_key/crm_customer_matches.csv so entity-resolution logic can be scored.
 
 Usage:
     uv run python generate_seed.py [--seed 42] [--out data/raw] [--shops 12]
@@ -112,6 +116,22 @@ STATUS_VARIANTS = {
     "cancelled": ["canceled", "Cancelled"],
 }
 
+# The CRM portal is configured for the company's HQ timezone and exports naive local time.
+CRM_PORTAL_TZ = ZoneInfo("America/New_York")
+LEAD_SOURCES = ["instagram", "google", "walk_in", "referral", "yelp"]
+NICKNAMES = {
+    "William": "Bill", "Robert": "Bob", "Michael": "Mike", "James": "Jim", "Richard": "Rick",
+    "Joseph": "Joe", "Thomas": "Tom", "Christopher": "Chris", "Daniel": "Dan", "Matthew": "Matt",
+    "Anthony": "Tony", "Benjamin": "Ben", "Nicholas": "Nick", "Samuel": "Sam", "Andrew": "Andy",
+    "Edward": "Ed", "Jennifer": "Jen", "Elizabeth": "Liz", "Katherine": "Kate", "Jessica": "Jess",
+}
+NICKNAMES |= {nick: full for full, nick in NICKNAMES.items()}
+EMAIL_DOMAIN_TYPOS = {
+    "gmail.com": ["gmial.com", "gmail.co", "gmai.com"],
+    "yahoo.com": ["yaho.com", "yahoo.con"],
+    "hotmail.com": ["hotmail.con", "hotmial.com"],
+}
+
 
 # --------------------------------------------------------------------------- helpers
 
@@ -140,8 +160,13 @@ def vary_email(rng: np.random.Generator, email: str) -> str:
     return variants[rng.integers(len(variants))]
 
 
+def phone_digits(phone: str) -> str:
+    """Last 10 digits of a phone number, ignoring any extension."""
+    return re.sub(r"\D", "", phone.split("x")[0])[-10:]
+
+
 def reformat_phone(rng: np.random.Generator, phone: str) -> str:
-    digits = re.sub(r"\D", "", phone.split("x")[0])[-10:]
+    digits = phone_digits(phone)
     a, b, c = digits[:3], digits[3:6], digits[6:]
     formats = [f"{a}{b}{c}", f"+1{a}{b}{c}", f"{a}-{b}-{c}", f"({a}) {b}-{c}", f"1.{a}.{b}.{c}"]
     return formats[rng.integers(len(formats))]
@@ -487,10 +512,11 @@ def build_billing_events(
 
 def inject_near_dupe_customers(
     rng: np.random.Generator, customers: list[dict], appts: list[dict], now: datetime, rate: float = 0.03
-) -> int:
+) -> dict[str, str]:
     """Same person signs up twice with a different id, email formatting and phone formatting.
 
     Some of their later appointments move to the new account, so dedupe matters downstream.
+    Returns {dupe customer_id: original customer_id}.
     """
     appts_by_customer = defaultdict(list)
     for a in appts:
@@ -498,6 +524,7 @@ def inject_near_dupe_customers(
     candidates = [c for c in customers if c["customer_id"] in appts_by_customer]
     picks = rng.choice(len(candidates), size=int(len(candidates) * rate), replace=False)
 
+    dupe_of = {}
     next_id = len(customers) + 1
     for idx in sorted(picks):
         orig = candidates[idx]
@@ -513,7 +540,204 @@ def inject_near_dupe_customers(
             if a["booked_at"] >= dupe["created_at"] and rng.random() < 0.6:
                 a["customer_id"] = dupe["customer_id"]
         customers.append(dupe)
-    return len(picks)
+        dupe_of[dupe["customer_id"]] = orig["customer_id"]
+    return dupe_of
+
+
+def crm_email(rng: np.random.Generator, fake: Faker, first: str, last: str, email: str) -> tuple[str | None, str]:
+    """The CRM's copy of a booking email: lowercased and trimmed, and often not the same address."""
+    email = email.strip().lower()
+    local, domain = email.split("@")
+    x = rng.random()
+    if x < 0.60:
+        return email, "email_exact"
+    if x < 0.70:  # work email, or moved to another provider
+        if rng.random() < 0.5:
+            return email_for(first, last, fake.domain_name()), "email_different"
+        return email_for(first, "", fake.free_email_domain(), str(int(rng.integers(10, 1000)))), "email_different"
+    if x < 0.77:
+        typos = EMAIL_DOMAIN_TYPOS.get(domain, [domain.replace(".com", ".con")])
+        return f"{local}@{typos[rng.integers(len(typos))]}", "email_typo"
+    if x < 0.84:  # gmail-style aliases that deliver to the same inbox
+        if "+" in local:
+            local = local.split("+")[0]
+        elif "." in local:
+            local = local.replace(".", "")
+        else:
+            local = f"{local}+booking"
+        return f"{local}@{domain}", "email_variant"
+    if x < 0.90:
+        handle = re.sub(r"[^a-z]", "", f"{first[0]}{last}".lower())
+        return f"{handle}{int(rng.integers(1, 100))}@{domain}", "email_local_differs"
+    return None, "email_null"
+
+
+def crm_phone(rng: np.random.Generator, phone: str) -> tuple[str | None, str]:
+    """The CRM's copy of a booking phone: E.164 with extensions dropped, and often not the same number."""
+    digits = phone_digits(phone)
+    x = rng.random()
+    if x < 0.65:
+        return f"+1{digits}", "phone_exact"
+    if x < 0.75:
+        new = "".join(str(d) for d in rng.integers(0, 10, size=7))
+        return f"+1{digits[:3]}{new}", "phone_different"
+    if x < 0.80:
+        d = list(digits)
+        i = int(rng.integers(3, 9))
+        if d[i] != d[i + 1] and rng.random() < 0.5:
+            d[i], d[i + 1] = d[i + 1], d[i]
+        else:
+            d[i] = str((int(d[i]) + int(rng.integers(1, 10))) % 10)
+        return f"+1{''.join(d)}", "phone_typo"
+    if x < 0.85:
+        return (digits if rng.random() < 0.5 else f"1{digits}"), "phone_format"
+    return None, "phone_null"
+
+
+def crm_name(rng: np.random.Generator, first: str, last: str) -> tuple[str, str, str]:
+    x = rng.random()
+    if x < 0.08 and first in NICKNAMES:
+        return NICKNAMES[first], last, "name_nickname"
+    if 0.08 <= x < 0.11:
+        return last, first, "name_swapped"
+    if 0.11 <= x < 0.16:
+        return (first, last.upper(), "name_noise") if rng.random() < 0.5 else (f"{first} ", last, "name_noise")
+    return first, last, "name_exact"
+
+
+def build_crm_contacts(
+    fake: Faker,
+    rng: np.random.Generator,
+    customers: list[dict],
+    dupe_of: dict[str, str],
+    shops: list[dict],
+    start: date,
+    now: datetime,
+    report: dict,
+) -> tuple[list[dict], list[dict]]:
+    """Marketing CRM contacts for (most of) the same people, plus CRM-only leads.
+
+    Returns (contacts, answer_key) where answer_key rows map crm_contact_id -> customer_id.
+    """
+    shop_by_id = {s["shop_id"]: s for s in shops}
+    dupes_by_orig = defaultdict(list)
+    for dupe_id, orig_id in dupe_of.items():
+        dupes_by_orig[orig_id].append(dupe_id)
+    all_customer_ids = [c["customer_id"] for c in customers]
+    contacts: list[dict] = []
+    answer_key: list[dict] = []
+    tags = Counter()
+
+    def location_for(shop):
+        return shop["name"] if rng.random() < 0.6 else shop["city"]
+
+    def activity_after(created):
+        return created + (now - created) * rng.uniform()
+
+    for c in customers:
+        if c["customer_id"] in dupe_of:
+            continue  # the CRM only ever saw one of the person's booking accounts
+        if rng.random() < 0.10:
+            tags["booking_customer_missing_from_crm"] += 1 + len(dupes_by_orig[c["customer_id"]])
+            continue
+
+        email, email_tag = crm_email(rng, fake, c["first_name"], c["last_name"], c["email"])
+        phone, phone_tag = crm_phone(rng, c["phone"])
+        first, last, name_tag = crm_name(rng, c["first_name"], c["last_name"])
+        mismatch = [t for t in (email_tag, phone_tag, name_tag) if not t.endswith("_exact")]
+
+        r = rng.random()
+        if r < 0.03:
+            # Points at the person's other booking account if they have one, else at a stranger.
+            linked_dupes = dupes_by_orig[c["customer_id"]]
+            if linked_dupes:
+                external_id = linked_dupes[0]
+                mismatch.append("external_id_dupe_account")
+            else:
+                external_id = all_customer_ids[rng.integers(len(all_customer_ids))]
+                mismatch.append("external_id_wrong")
+        elif r < 0.53:
+            external_id = c["customer_id"]
+        else:
+            external_id = None
+
+        created = min(c["created_at"] + timedelta(hours=int(rng.integers(0, 24 * 30))), now)
+        opt_out = not c["marketing_opt_in"]
+        if rng.random() < 0.10:
+            opt_out = not opt_out
+        contact = {
+            "crm_contact_id": make_id(rng, "crm", 8),
+            "booking_customer_id": external_id,
+            "first_name": first,
+            "last_name": last,
+            "email": email,
+            "phone": phone,
+            "preferred_location": location_for(shop_by_id[c["home_shop_id"]]),
+            "lifecycle_stage": "customer" if rng.random() < 0.8 else "lapsed",
+            "lead_source": str(rng.choice(LEAD_SOURCES)),
+            "email_opt_out": opt_out,
+            "created_at": created,
+            "last_activity_at": activity_after(created),
+        }
+        contacts.append(contact)
+        tags.update(mismatch)
+        match_type = "+".join(mismatch) or "clean"
+        for customer_id in [c["customer_id"], *dupes_by_orig[c["customer_id"]]]:
+            answer_key.append({"crm_contact_id": contact["crm_contact_id"], "customer_id": customer_id, "match_type": match_type})
+    tags["linked_contacts"] = len(contacts)
+
+    # CRM-internal duplicates: a list import created the same person again.
+    linked = list(contacts)
+    keyed = defaultdict(list)
+    for row in answer_key:
+        keyed[row["crm_contact_id"]].append(row)
+    for idx in rng.choice(len(linked), size=int(len(linked) * 0.02), replace=False):
+        orig = linked[idx]
+        dupe = dict(orig)
+        dupe["crm_contact_id"] = make_id(rng, "crm", 8)
+        dupe["booking_customer_id"] = None
+        dupe["phone"] = None if rng.random() < 0.5 else orig["phone"]
+        dupe["lead_source"] = "import"
+        dupe["created_at"] = activity_after(orig["created_at"])
+        dupe["last_activity_at"] = activity_after(dupe["created_at"])
+        contacts.append(dupe)
+        for row in keyed[orig["crm_contact_id"]]:
+            answer_key.append(row | {"crm_contact_id": dupe["crm_contact_id"], "match_type": row["match_type"] + "+crm_duplicate"})
+    tags["crm_internal_dupes"] = int(len(linked) * 0.02)
+
+    # CRM-only leads who never booked; some share a surname and shop with a real customer.
+    window_start = datetime.combine(start, time(0), UTC)
+    n_leads = int(len(customers) * 0.15)
+    for _ in range(n_leads):
+        first = fake.first_name()
+        if rng.random() < 0.3:
+            lookalike = customers[rng.integers(len(customers))]
+            last, shop = lookalike["last_name"], shop_by_id[lookalike["home_shop_id"]]
+        else:
+            last, shop = fake.last_name(), shops[rng.integers(len(shops))]
+        created = window_start + (now - window_start) * rng.uniform()
+        contacts.append(
+            {
+                "crm_contact_id": make_id(rng, "crm", 8),
+                "booking_customer_id": None,
+                "first_name": first,
+                "last_name": last,
+                "email": email_for(first, last, fake.free_email_domain()) if rng.random() < 0.9 else None,
+                "phone": f"+1{phone_digits(fake.phone_number())}" if rng.random() < 0.6 else None,
+                "preferred_location": location_for(shop),
+                "lifecycle_stage": "lead",
+                "lead_source": str(rng.choice(LEAD_SOURCES)),
+                "email_opt_out": bool(rng.random() < 0.3),
+                "created_at": created,
+                "last_activity_at": activity_after(created),
+            }
+        )
+    tags["crm_only_leads"] = n_leads
+
+    report.update(sorted(tags.items()))
+    contacts.sort(key=lambda r: r["crm_contact_id"])
+    answer_key.sort(key=lambda r: (r["crm_contact_id"], r["customer_id"]))
+    return contacts, answer_key
 
 
 # --------------------------------------------------------------------------- messes
@@ -633,6 +857,12 @@ def mess_appointments(
     return df
 
 
+def mess_crm_contacts(df: pd.DataFrame) -> pd.DataFrame:
+    df["created_at"] = [d.astimezone(CRM_PORTAL_TZ).strftime("%Y-%m-%d %H:%M:%S") for d in df["created_at"]]
+    df["last_activity_at"] = [int(d.timestamp() * 1000) for d in df["last_activity_at"]]
+    return df
+
+
 def mess_billing_events(events: list[dict], rng: np.random.Generator, report: dict) -> list[dict]:
     # Webhook replays: the processor redelivers the same event_id later.
     replays = []
@@ -670,13 +900,20 @@ def mess_billing_events(events: list[dict], rng: np.random.Generator, report: di
 # --------------------------------------------------------------------------- output
 
 
-def write_outputs(out_dir: Path, frames: dict[str, pd.DataFrame], events: list[dict]) -> None:
+def write_outputs(
+    out_dir: Path, frames: dict[str, pd.DataFrame], events: list[dict], answer_key: list[dict]
+) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     for name, df in frames.items():
         df.to_csv(out_dir / f"{name}.csv", index=False)
     with open(out_dir / "billing_events.jsonl", "w") as f:
         for e in events:
             f.write(json.dumps(e) + "\n")
+    # Kept outside the raw landing zone so models can't read the answers by accident.
+    key_dir = out_dir.parent / "answer_key"
+    key_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(answer_key).to_csv(key_dir / "crm_customer_matches.csv", index=False)
+    return key_dir
 
 
 def print_summary(out_dir: Path, start: date, end: date, seed: int, rows: dict, report: dict) -> None:
@@ -713,8 +950,16 @@ def main() -> None:
     customers = build_customers(fake, rng, args.customers, shops)
     appts = build_appointments(rng, shops, barbers, customers, start, end, now)
     assign_customer_signups(rng, customers, appts, start, now)
-    report["customers"]["near_dupe_customers"] = inject_near_dupe_customers(rng, customers, appts, now)
+    dupe_of = inject_near_dupe_customers(rng, customers, appts, now)
+    report["customers"]["near_dupe_customers"] = len(dupe_of)
     events = build_billing_events(rng, shops, appts, start, now)
+
+    # The CRM gets its own random streams so adding it doesn't shift the other sources.
+    crm_fake = Faker("en_US")
+    crm_fake.seed_instance(args.seed + 1)
+    crm_contacts, answer_key = build_crm_contacts(
+        crm_fake, np.random.default_rng([args.seed, 1]), customers, dupe_of, shops, start, now, report["crm_contacts"]
+    )
 
     frames = {
         "shops": mess_shops(pd.DataFrame(shops), rng, report["shops"]),
@@ -723,10 +968,12 @@ def main() -> None:
         "appointments": mess_appointments(pd.DataFrame(appts), rng, shops, report["appointments"]),
     }
     events = mess_billing_events(events, rng, report["billing_events"])
+    frames["crm_contacts"] = mess_crm_contacts(pd.DataFrame(crm_contacts))
 
-    write_outputs(args.out, frames, events)
+    key_dir = write_outputs(args.out, frames, events, answer_key)
     rows = {name: len(df) for name, df in frames.items()} | {"billing_events": len(events)}
     print_summary(args.out, start, end, args.seed, rows, report)
+    print(f"\nAnswer key: {key_dir}/crm_customer_matches.csv ({len(answer_key):,} rows)")
 
 
 if __name__ == "__main__":

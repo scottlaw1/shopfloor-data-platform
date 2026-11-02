@@ -1,0 +1,18 @@
+[project]
+name = "shopfloor-data-platform"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "dagster>=1.13.28",
+    "dagster-dbt>=0.29.28",
+    "dbt-duckdb>=1.11.1",
+    "faker>=40.44.0",
+    "pandas>=3.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "dagster-webserver>=1.13.28",
+]
